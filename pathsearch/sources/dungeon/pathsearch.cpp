@@ -1,4 +1,5 @@
 #include "pathsearch.hpp"
+#include "assert.hpp"
 #include "dungeon/dungeon.hpp"
 #include "dungeon/pathsearch.hpp"
 #include "../glmFormatter.hpp"
@@ -7,7 +8,6 @@
 #include <unordered_set>
 #include <queue>
 #include <map>
-#include <glm/gtx/hash.hpp>
 #include <spdlog/spdlog.h>
 #include <fmt/ranges.h>
 
@@ -217,6 +217,304 @@ std::experimental::generator<SearchResult> araStar(DungeonView dungeon, glm::ive
     for (auto v : inconsistent)
       open.emplace(fScore(v), v);
   }
+}
+
+
+HierarchicalSearchData buildHierarchy(DungeonView dungeon, int cellSize)
+{
+  NG_ASSERT(dungeon.extent(0) % cellSize == 0 && dungeon.extent(1) % cellSize == 0);
+
+  HierarchicalSearchData result{.cellSize = cellSize};
+
+  for (int y = 0; y < dungeon.extent(1) / cellSize; ++y)
+  {
+    for (int x = 0; x < dungeon.extent(0) / cellSize; ++x)
+    {
+      glm::ivec2 cellStart = cellSize * glm::ivec2{x, y};
+      // Find portals on top
+      if (y > 0)
+      {
+        const int yStart = cellStart.y - 1;
+        const int yEnd = cellStart.y + 1;
+
+        for (int xStart = cellStart.x; xStart < cellStart.x + cellSize; ++xStart)
+        {
+          int xEnd = xStart;
+          while (xEnd < cellStart.x + cellSize && dungeon(yStart, xEnd) != Tile::Wall && dungeon(yStart + 1, xEnd) != Tile::Wall)
+            ++xEnd;
+
+          if (xEnd > xStart)
+          {
+            result.portals.push_back(Portal{glm::ivec2{xStart, yStart}, glm::ivec2{xEnd, yEnd}, {}});
+            result.cellToPortalList.emplace(glm::ivec2{x, y}, result.portals.size() - 1);
+            if (y > 0)
+              result.cellToPortalList.emplace(glm::ivec2{x, y - 1}, result.portals.size() - 1);
+            xStart = xEnd;
+          }
+        }
+      }
+
+      // Find portals to the left
+      if (x > 0)
+      {
+        const int xStart = cellStart.x - 1;
+        const int xEnd = cellStart.x + 1;
+
+        for (int yStart = cellStart.y; yStart < cellStart.y + cellSize; ++yStart)
+        {
+          int yEnd = yStart;
+          while (yEnd < cellStart.y + cellSize && dungeon(yEnd, xStart) != Tile::Wall && dungeon(yEnd, xStart + 1) != Tile::Wall)
+            ++yEnd;
+
+          if (yEnd > yStart)
+          {
+            result.portals.push_back(Portal{glm::ivec2{xStart, yStart}, glm::ivec2{xEnd, yEnd}, {}});
+            result.cellToPortalList.emplace(glm::ivec2{x, y}, result.portals.size() - 1);
+            if (x > 0)
+              result.cellToPortalList.emplace(glm::ivec2{x - 1, y}, result.portals.size() - 1);
+            yStart = yEnd;
+          }
+        }
+      }
+    }
+  }
+
+  for (int y = 0; y < dungeon.extent(0) / cellSize; ++y)
+  {
+    for (int x = 0; x < dungeon.extent(1) / cellSize; ++x)
+    {
+      glm::ivec2 cellStart = cellSize * glm::ivec2{x, y};
+
+      // Run floyd's algo to find shortest paths between all points
+
+      using Exts = std::experimental::extents<int,
+        std::experimental::dynamic_extent, std::experimental::dynamic_extent, std::experimental::dynamic_extent, std::experimental::dynamic_extent>;
+
+      std::experimental::mdarray<float, Exts> dists(Exts{cellSize, cellSize, cellSize, cellSize}, INF);
+      std::experimental::mdarray<glm::ivec2, Exts> next(dists.extents());
+
+      // Encode the cell subgraph into dists/next tensor
+      for (int y1 = 0; y1 < dists.extent(0); ++y1)
+      {
+        for (int x1 = 0; x1 < dists.extent(1); ++x1)
+        {
+          glm::ivec2 v{x1, y1};
+          dists(y1, x1, y1, x1) = 0;
+          next(y1, x1, y1, x1) = v;
+
+          for (auto w : successorsFor(v + cellStart, dungeon))
+          {
+            auto w1 = w - cellStart;
+            if (w1.x < 0 || w1.y < 0 || w1.x >= cellSize || w1.y >= cellSize)
+              continue;
+            dists(y1, x1, w1.y, w1.x) = weight(dungeon, v + cellStart, w);
+            next(y1, x1, w1.y, w1.x) = w1;
+          }
+        }
+      }
+
+      // Run the optimization procedure
+      for (int y1 = 0; y1 < cellSize; ++y1)
+        for (int x1 = 0; x1 < cellSize; ++x1)
+          for (int y2 = 0; y2 < cellSize; ++y2)
+            for (int x2 = 0; x2 < cellSize; ++x2)
+              for (int y3 = 0; y3 < cellSize; ++y3)
+                for (int x3 = 0; x3 < cellSize; ++x3)
+                {
+                  // Try to optimize path from 2 to 3 through 1
+                  float& oldDist = dists(y2, x2, y3, x3);
+                  float newDist = dists(y2, x2, y1, x1) + dists(y1, x1, y3, x3);
+                  if (oldDist > newDist)
+                  {
+                    oldDist = newDist;
+                    next(y2, x2, y3, x3) = next(y2, x2, y1, x1);
+                  }
+                }
+
+      const auto[b, e] = result.cellToPortalList.equal_range(glm::ivec2{x, y});
+      for (auto i = b; i != e; ++i)
+      {
+        for (auto j = b; j != e; ++j)
+        {
+          if (i == j)
+            continue;
+
+          const auto& p1 = result.portals[i->second];
+          const auto& p2 = result.portals[j->second];
+
+          const auto p1TopLeft     = glm::min(glm::max(p1.topLeft     - cellStart, glm::ivec2{0}), glm::ivec2{cellSize});
+          const auto p1BottomRight = glm::min(glm::max(p1.bottomRight - cellStart, glm::ivec2{0}), glm::ivec2{cellSize});
+          const auto p2TopLeft     = glm::min(glm::max(p2.topLeft     - cellStart, glm::ivec2{0}), glm::ivec2{cellSize});
+          const auto p2BottomRight = glm::min(glm::max(p2.bottomRight - cellStart, glm::ivec2{0}), glm::ivec2{cellSize});
+
+          glm::ivec2 start = p1TopLeft;
+          glm::ivec2 end = p2TopLeft;
+          float shortest = INF;
+          float longest = 0;
+          for (int yStart = p1TopLeft.y; yStart < p1BottomRight.y; ++yStart)
+            for (int xStart = p1TopLeft.x; xStart < p1BottomRight.x; ++xStart)
+              for (int yEnd = p2TopLeft.y; yEnd < p2BottomRight.y; ++yEnd)
+                for (int xEnd = p2TopLeft.x; xEnd < p2BottomRight.x; ++xEnd)
+                {
+                  float d = dists(yStart, xStart, yEnd, xEnd);
+                  if (d < shortest)
+                  {
+                    shortest = d;
+                    start = {xStart, yStart};
+                    end = {xEnd, yEnd};
+                  }
+                  if (d > longest)
+                    longest = d;
+                }
+
+          if (shortest >= INF)
+            continue;
+
+          // record as adjacent
+
+          auto& adj = result.portals[i->second].adjacent[j->second];
+
+          adj.dist = (shortest + longest) / 2.f; // dirty hack
+
+          while (start != end)
+          {
+            adj.path.push_back(start + cellStart);
+            start = next(start.y, start.x, end.y, end.x);
+          }
+          adj.path.push_back(start + cellStart);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+static std::vector<std::size_t> portalSearch(const HierarchicalSearchData& data, std::size_t start, std::size_t finish)
+{
+  using Pair = std::pair<float, std::size_t>;
+
+  struct Comp
+  {
+    bool operator()(const Pair& a, const Pair& b)
+      { return a.first > b.first; }
+  };
+
+
+  auto portalDist = [&data](std::size_t a, std::size_t b) { return glm::length(data.portals[a].midpoint() - data.portals[b].midpoint()); };
+
+  std::priority_queue<Pair> queue;
+  std::vector<float> dists(data.portals.size(), INF);
+  queue.push({portalDist(start, finish), start});
+  dists[start] = 0;
+
+  while (!queue.empty())
+  {
+    auto current = queue.top().second;
+    queue.pop();
+
+    if (current == finish)
+      break;
+
+    auto dist = dists[current];
+
+    for (const auto&[successor, adj] : data.portals[current].adjacent)
+    {
+      float successor_dist = dist + adj.dist;
+      if (successor_dist < dists[successor])
+      {
+        dists[successor] = successor_dist;
+        queue.push({successor_dist + portalDist(successor, finish), successor});
+      }
+    }
+  }
+
+  std::vector<std::size_t> result;
+
+  if (dists[finish] != INF)
+  {
+    auto current = finish;
+
+    result.push_back(current);
+    while (current != start)
+    {
+      auto best = current;
+      for (const auto&[successor, _] : data.portals[current].adjacent)
+        if (dists[successor] < dists[best])
+          best = successor;
+
+      if (best == current)
+        break;
+
+      current = best;
+      result.push_back(current);
+    }
+  }
+
+  std::reverse(result.begin(), result.end());
+
+  return result;
+}
+
+// Walks "straight" to the target. Behaviour undefined if the target is not reachable that way
+static void appendStraightPath(DungeonView dungeon, SearchResult& result, glm::ivec2 target)
+{
+  while (result.path.back() != target)
+  {
+    auto best = result.path.back();
+    for (auto successor : successorsFor(result.path.back(), dungeon))
+      if (ivecDist(best, target) > ivecDist(successor, target))
+        best = successor;
+
+    if (best == result.path.back())
+      break;
+
+    result.path.push_back(best);
+  }
+}
+
+SearchResult hierarchicalSearch(DungeonView dungeon, const HierarchicalSearchData& data, glm::ivec2 start, glm::ivec2 finish)
+{
+  // This is hacky. Only clicking on portal tiles is supported.
+  // It is not clear how to do the general case:
+  // - Check all possible "entrance" and "exit" portals? Too long!
+  // - Come to the closest portal? Can be extremely non-optimal!
+
+  constexpr std::size_t NOT_FOUND = static_cast<std::size_t>(-1);
+
+  std::size_t entrance = NOT_FOUND;
+  std::size_t exit = NOT_FOUND;
+  for (std::size_t i = 0; i < data.portals.size(); ++i)
+  {
+    if (data.portals[i].contains(start))
+      entrance = i;
+    if (data.portals[i].contains(finish))
+      exit = i;
+  }
+
+  SearchResult result;
+  if (entrance == NOT_FOUND || exit == NOT_FOUND)
+    return result;
+
+  result.path.push_back(start);
+
+  auto portalPath = portalSearch(data, entrance, exit);
+
+  for (std::size_t i = 1; i < portalPath.size(); ++i)
+  {
+    const auto portalFrom = portalPath[i - 1];
+    const auto portalTo = portalPath[i];
+
+    const auto& path = data.portals[portalFrom].adjacent.at(portalTo).path;
+
+    appendStraightPath(dungeon, result, path.front());
+
+    result.path.insert(result.path.cend(), path.begin(), path.end());
+  }
+
+  appendStraightPath(dungeon, result, finish);
+
+  return result;
 }
 
 }

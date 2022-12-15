@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0067 NEW)
 project(pathsearch C CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS on)
 
 if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
   message(
@@ -63,7 +64,7 @@ else()
 endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT MATCHES "MSVC")
-    add_compile_options(/std:c++20 /std:c17)
+    add_compile_options(/std:c++20)
 endif()
 
 add_subdirectory("pathsearch")
